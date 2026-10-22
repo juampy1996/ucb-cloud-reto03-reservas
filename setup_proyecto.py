@@ -1,0 +1,542 @@
+import os
+
+estructura = {
+    "backend": {
+        "lambda_function.py": '''import json
+import os
+import time
+import uuid
+from datetime import datetime, timezone
+import boto3
+from botocore.exceptions import ClientError
+
+dynamodb = boto3.resource("dynamodb")
+tabla = dynamodb.Table(os.environ.get("TABLA_RESERVAS", "ucb-reservas-jpm"))
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "ucb-admin-2026")
+
+HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,X-Admin-Key"
+}
+
+def respuesta(codigo, cuerpo):
+    return {"statusCode": codigo, "headers": HEADERS, "body": json.dumps(cuerpo, ensure_ascii=False)}
+
+def emitir_metrica(operacion, resultado):
+    print(json.dumps({
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [{
+                "Namespace": "UCB/Reservas",
+                "Dimensions": [["Operacion", "Resultado"]],
+                "Metrics": [{"Name": "Solicitudes", "Unit": "Count"}]
+            }]
+        },
+        "Operacion": operacion,
+        "Resultado": resultado,
+        "Solicitudes": 1
+    }))
+
+def lambda_handler(event, context):
+    metodo = event.get("requestContext", {}).get("http", {}).get("method") or event.get("httpMethod", "GET")
+    if metodo == "OPTIONS":
+        return respuesta(200, {"mensaje": "CORS OK"})
+
+    params = event.get("queryStringParameters") or {}
+    headers_req = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+    clave_enviada = headers_req.get("x-admin-key") or params.get("admin_key")
+
+    body = {}
+    if event.get("body"):
+        try:
+            body = json.loads(event["body"])
+        except ValueError:
+            return respuesta(400, {"error": "JSON inválido"})
+
+    if metodo == "GET":
+        items = tabla.scan().get("Items", [])
+        recurso_filtro = params.get("recurso")
+        if recurso_filtro:
+            items = [i for i in items if i.get("recurso") == recurso_filtro]
+        items.sort(key=lambda x: x.get("slot_id", ""))
+        emitir_metrica("CONSULTAR", "EXITO")
+        return respuesta(200, {"total": len(items), "reservas": items})
+
+    if metodo == "POST":
+        recurso = body.get("recurso", "").strip()
+        fecha = body.get("fecha", "").strip()
+        hora = body.get("hora", "").strip()
+        cliente = body.get("cliente", "").strip()
+        servicio = body.get("servicio", "Consulta General").strip()
+
+        if not (recurso and fecha and hora and cliente):
+            emitir_metrica("CREAR", "ERROR_VALIDACION")
+            return respuesta(400, {"error": "Faltan campos obligatorios: recurso, fecha, hora, cliente"})
+
+        slot_id = f"{recurso}#{fecha}#{hora}"
+        item = {
+            "slot_id": slot_id,
+            "reserva_id": str(uuid.uuid4())[:8],
+            "recurso": recurso,
+            "fecha": fecha,
+            "hora": hora,
+            "cliente": cliente,
+            "servicio": servicio,
+            "estado": "CONFIRMADA",
+            "actualizado_utc": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            tabla.put_item(
+                Item=item,
+                ConditionExpression="attribute_not_exists(slot_id) OR estado = :cancelada",
+                ExpressionAttributeValues={":cancelada": "CANCELADA"}
+            )
+            emitir_metrica("CREAR", "CONFIRMADA")
+            return respuesta(201, {"mensaje": "Reserva confirmada con éxito", "reserva": item})
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                emitir_metrica("CREAR", "CONFLICTO_DUPLICADO")
+                return respuesta(409, {
+                    "error": "CONFLICTO: El recurso ya está reservado en esa fecha y horario.",
+                    "slot_id": slot_id
+                })
+            raise e
+
+    if clave_enviada != ADMIN_KEY and body.get("admin_key") != ADMIN_KEY:
+        emitir_metrica(metodo, "NO_AUTORIZADO")
+        return respuesta(403, {"error": "Acceso denegado: Clave de administración inválida o ausente"})
+
+    if metodo == "PUT":
+        slot_id = body.get("slot_id")
+        nuevo_cliente = body.get("cliente")
+        nuevo_servicio = body.get("servicio")
+        if not (slot_id and nuevo_cliente and nuevo_servicio):
+            return respuesta(400, {"error": "Envía slot_id, cliente y servicio para modificar"})
+        try:
+            res = tabla.update_item(
+                Key={"slot_id": slot_id},
+                UpdateExpression="SET cliente = :c, servicio = :s, actualizado_utc = :u",
+                ConditionExpression="attribute_exists(slot_id)",
+                ExpressionAttributeValues={
+                    ":c": nuevo_cliente,
+                    ":s": nuevo_servicio,
+                    ":u": datetime.now(timezone.utc).isoformat()
+                },
+                ReturnValues="ALL_NEW"
+            )
+            emitir_metrica("MODIFICAR", "EXITO")
+            return respuesta(200, {"mensaje": "Reserva modificada", "reserva": res["Attributes"]})
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return respuesta(404, {"error": "La reserva indicada no existe"})
+            raise e
+
+    if metodo == "DELETE":
+        slot_id = params.get("slot_id") or body.get("slot_id")
+        if not slot_id:
+            return respuesta(400, {"error": "Debes indicar el slot_id a cancelar"})
+        try:
+            res = tabla.update_item(
+                Key={"slot_id": slot_id},
+                UpdateExpression="SET estado = :est, actualizado_utc = :u",
+                ConditionExpression="attribute_exists(slot_id)",
+                ExpressionAttributeValues={
+                    ":est": "CANCELADA",
+                    ":u": datetime.now(timezone.utc).isoformat()
+                },
+                ReturnValues="ALL_NEW"
+            )
+            emitir_metrica("CANCELAR", "EXITO")
+            return respuesta(200, {"mensaje": "Reserva cancelada; horario liberado", "reserva": res["Attributes"]})
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                return respuesta(404, {"error": "La reserva no existe"})
+            raise e
+
+    return respuesta(405, {"error": "Método no permitido"})
+'''
+    },
+    "frontend": {
+        "index.html": '''<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UCB · Sistema de Reservas y Citas</title>
+  <style>
+    :root {
+      --ucb-blue: #005289; --ucb-dark: #003a61; --ucb-yellow: #FFCD00;
+      --bg: #f1f5f9; --card: #ffffff; --text: #0f172a; --muted: #64748b;
+      --border: #e2e8f0; --ok-bg: #dcfce7; --ok-txt: #166534;
+      --err-bg: #fee2e2; --err-txt: #991b1b; --warn-bg: #fef3c7; --warn-txt: #92400e;
+    }
+    * { box-sizing: border-box; }
+    body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; margin: 0; background: var(--bg); color: var(--text); }
+    header {
+      background: linear-gradient(135deg, var(--ucb-blue), var(--ucb-dark));
+      color: white; padding: 16px 28px; border-bottom: 4px solid var(--ucb-yellow);
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px;
+    }
+    header h1 { margin: 0; font-size: 1.3rem; font-weight: 700; }
+    header p { margin: 4px 0 0; font-size: 0.82rem; opacity: 0.9; }
+    .role-switcher {
+      display: flex; align-items: center; gap: 8px; background: rgba(0, 0, 0, 0.22);
+      padding: 5px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    .role-btn {
+      border: none; background: transparent; color: #e2e8f0; padding: 7px 14px;
+      border-radius: 999px; font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: all 0.2s;
+    }
+    .role-btn.active { background: var(--ucb-yellow); color: #0f172a; box-shadow: 0 2px 6px rgba(0,0,0,0.2); }
+    .wrapper { max-width: 1180px; margin: 20px auto; padding: 0 18px; }
+    .admin-topbar {
+      background: #1e293b; color: white; padding: 10px 18px; border-radius: 10px;
+      margin-bottom: 16px; display: none; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; font-size: 0.84rem;
+    }
+    .admin-topbar .chip-btn {
+      background: rgba(255,255,255,0.12); color: white; border: 1px solid rgba(255,255,255,0.25);
+      padding: 5px 11px; border-radius: 6px; cursor: pointer; font-size: 0.78rem; font-weight: 600;
+    }
+    .admin-topbar .chip-btn:hover { background: rgba(255,255,255,0.22); }
+    .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 20px; }
+    .kpi-card {
+      background: var(--card); padding: 14px 18px; border-radius: 10px;
+      border: 1px solid var(--border); box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .kpi-card span { font-size: 0.78rem; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+    .kpi-card strong { font-size: 1.55rem; color: var(--ucb-blue); display: block; margin-top: 2px; }
+    .main-grid { display: grid; grid-template-columns: 390px 1fr; gap: 20px; align-items: start; }
+    @media (max-width: 900px) { .main-grid { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); padding: 20px; border-radius: 12px;
+      border: 1px solid var(--border); box-shadow: 0 2px 8px rgba(15, 23, 42, 0.04);
+    }
+    .card-title {
+      margin: 0 0 14px; font-size: 1.06rem; color: var(--ucb-blue);
+      display: flex; justify-content: space-between; align-items: center;
+      border-bottom: 1px solid var(--border); padding-bottom: 10px;
+    }
+    #alerta { padding: 12px 14px; border-radius: 8px; margin-bottom: 14px; display: none; font-size: 0.86rem; font-weight: 600; border-left: 4px solid transparent; }
+    label { display: block; margin-top: 12px; font-size: 0.82rem; font-weight: 600; color: #334155; }
+    input, select { width: 100%; padding: 9px 11px; margin-top: 5px; border: 1px solid #cbd5e1; border-radius: 7px; font-size: 0.9rem; background: #f8fafc; }
+    input:focus, select:focus { outline: none; border-color: var(--ucb-blue); background: #fff; }
+    .slots-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 6px; }
+    .slot-btn {
+      padding: 8px 6px; border-radius: 7px; border: 1.5px solid #cbd5e1;
+      background: #fff; cursor: pointer; text-align: center; font-size: 0.82rem; font-weight: 600; transition: all 0.15s;
+    }
+    .slot-btn small { display: block; font-size: 0.68rem; font-weight: 500; margin-top: 2px; }
+    .slot-btn.free { border-color: #86efac; background: #f0fdf4; color: #166534; }
+    .slot-btn.busy { border-color: #fca5a5; background: #fef2f2; color: #991b1b; }
+    .slot-btn.selected { outline: 2.5px solid var(--ucb-blue); transform: scale(1.02); font-weight: 700; }
+    .btn { width: 100%; padding: 10px 14px; border-radius: 7px; border: none; font-weight: 600; font-size: 0.9rem; cursor: pointer; margin-top: 14px; }
+    .btn-primary { background: var(--ucb-blue); color: white; }
+    .btn-sm { width: auto; padding: 6px 11px; margin: 0; font-size: 0.78rem; border-radius: 6px; }
+    .btn-edit { background: #f59e0b; color: white; margin-right: 4px; }
+    .btn-cancel { background: #ef4444; color: white; }
+    .toolbar { display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+    .toolbar input, .toolbar select { margin-top: 0; padding: 7px 10px; font-size: 0.83rem; flex: 1; min-width: 150px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.86rem; }
+    th { background: #f8fafc; color: #475569; font-weight: 600; text-align: left; padding: 10px; border-bottom: 2px solid var(--border); }
+    td { padding: 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .badge { padding: 4px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 700; display: inline-block; }
+    .CONFIRMADA { background: var(--ok-bg); color: var(--ok-txt); }
+    .CANCELADA { background: var(--err-bg); color: var(--err-txt); text-decoration: line-through; }
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.58); display: none; align-items: center; justify-content: center; z-index: 100; }
+    .modal { background: white; width: 92%; max-width: 410px; border-radius: 12px; padding: 22px; box-shadow: 0 10px 25px rgba(0,0,0,0.22); }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Clínica & Centro de Servicios UCB — Portal de Citas</h1>
+      <p>Estudiante: Juan Pablo Meriles · Reto 03: API REST + Escritura Condicional en DynamoDB</p>
+    </div>
+    <div class="role-switcher">
+      <button class="role-btn active" id="tabPaciente" onclick="cambiarRol('paciente')">👤 Vista Paciente</button>
+      <button class="role-btn" id="tabAdmin" onclick="intentarAccesoAdmin()">🔐 Recepción / Admin</button>
+    </div>
+  </header>
+  <div class="wrapper">
+    <div class="admin-topbar" id="adminTopbar">
+      <div>
+        <strong>🔐 Sesión de Recepción Activa</strong>
+        <span id="estadoClaveTexto" style="margin-left:8px;color:#4ade80;">(Credencial X-Admin-Key válida)</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="chip-btn" onclick="activarModoPrueba403()">🧪 Simular clave errónea (Probar Error 403)</button>
+        <button class="chip-btn" style="background:#dc2626;border-color:#dc2626;" onclick="cambiarRol('paciente')">Cerrar sesión Admin</button>
+      </div>
+    </div>
+    <div class="kpi-grid" id="panelKPIs" style="display:none;">
+      <div class="kpi-card"><div><span>Total Registros</span><strong id="kpiTotal">0</strong></div><div style="font-size:1.5rem;">📅</div></div>
+      <div class="kpi-card"><div><span>Citas Confirmadas</span><strong id="kpiConfirmadas" style="color:#166534;">0</strong></div><div style="font-size:1.5rem;">✅</div></div>
+      <div class="kpi-card"><div><span>Citas Canceladas</span><strong id="kpiCanceladas" style="color:#991b1b;">0</strong></div><div style="font-size:1.5rem;">🚫</div></div>
+      <div class="kpi-card"><div><span>Control Concurrencia</span><strong style="font-size:0.95rem;margin-top:6px;">ConditionExpression</strong></div><div style="font-size:1.5rem;">🛡️</div></div>
+    </div>
+    <div class="main-grid">
+      <div class="card">
+        <h2 class="card-title"><span id="tituloFormulario">Reservar Nuevo Turno</span></h2>
+        <div id="alerta"></div>
+        <label>1. Especialidad / Consultorio</label>
+        <select id="recurso" onchange="actualizarGrillaHorarios()">
+          <option value="Consultorio-1">Consultorio 1 (Medicina General)</option>
+          <option value="Consultorio-2">Consultorio 2 (Odontología)</option>
+          <option value="Sala-RayosX">Sala de Rayos X (Diagnóstico)</option>
+        </select>
+        <label>2. Fecha deseada</label>
+        <input type="date" id="fecha" value="2026-10-25" onchange="actualizarGrillaHorarios()">
+        <label>3. Horarios del día <small style="font-weight:normal;color:#64748b;">(Verde = libre · Rojo = ocupado)</small></label>
+        <input type="hidden" id="hora" value="09:00">
+        <div class="slots-grid" id="slotsContainer"></div>
+        <label>4. Nombre completo del Paciente</label>
+        <input type="text" id="cliente" placeholder="Ej. Juan Carlos Lozano">
+        <label>5. Tipo de prestación / Servicio</label>
+        <select id="servicio">
+          <option value="Consulta General">Consulta General</option>
+          <option value="Limpieza / Control Odontológico">Limpieza / Control Odontológico</option>
+          <option value="Radiografía Panorámica">Radiografía Panorámica</option>
+          <option value="Revisión de Resultados">Revisión de Resultados</option>
+        </select>
+        <button class="btn btn-primary" id="btnCrear" onclick="crearReserva()">Confirmar Reserva</button>
+      </div>
+      <div class="card">
+        <h2 class="card-title">
+          <span id="tituloTabla">Horarios y Citas Registradas</span>
+          <button class="btn btn-sm" style="background:var(--ucb-blue);color:white;" onclick="cargarReservas()">🔄 Actualizar</button>
+        </h2>
+        <div class="toolbar">
+          <input type="text" id="buscador" placeholder="🔍 Buscar por nombre o servicio..." oninput="renderizarTabla()">
+          <select id="filtroRecurso" onchange="renderizarTabla()">
+            <option value="">Todos los consultorios</option>
+            <option value="Consultorio-1">Consultorio 1</option>
+            <option value="Consultorio-2">Consultorio 2</option>
+            <option value="Sala-RayosX">Sala de Rayos X</option>
+          </select>
+          <select id="filtroEstado" onchange="renderizarTabla()">
+            <option value="">Todos los estados</option>
+            <option value="CONFIRMADA">Confirmadas</option>
+            <option value="CANCELADA">Canceladas</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Consultorio / Horario</th>
+                <th>Paciente</th>
+                <th>Servicio</th>
+                <th>Estado</th>
+                <th id="thAcciones" style="text-align:right;display:none;">Gestión (Admin)</th>
+              </tr>
+            </thead>
+            <tbody id="tablaBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="modalLogin">
+    <div class="modal">
+      <h3 style="margin-top:0;color:var(--ucb-blue);">🔐 Acceso Recepción / Administración</h3>
+      <p style="font-size:0.84rem;color:#64748b;margin-top:-4px;">Ingresa la credencial configurada en AWS Lambda (<code>ADMIN_KEY</code>).</p>
+      <label>Clave de Acceso (X-Admin-Key)</label>
+      <input type="password" id="inputLoginKey" value="ucb-admin-2026">
+      <small style="display:block;margin-top:6px;color:#64748b;">Clave de prueba: <b>ucb-admin-2026</b></small>
+      <div class="modal-actions">
+        <button class="btn btn-sm" style="background:#e2e8f0;color:#334155;" onclick="cerrarModalLogin()">Cancelar</button>
+        <button class="btn btn-sm" style="background:var(--ucb-blue);color:white;" onclick="confirmarLoginAdmin()">Ingresar</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-backdrop" id="modalEditar">
+    <div class="modal">
+      <h3 style="margin-top:0;color:var(--ucb-blue);">✏️ Reprogramar / Editar Cita</h3>
+      <p id="modalSlotInfo" style="font-size:0.82rem;color:#64748b;margin-top:-6px;"></p>
+      <input type="hidden" id="editSlotId">
+      <label>Nombre del Paciente</label>
+      <input type="text" id="editCliente">
+      <label>Motivo / Servicio</label>
+      <input type="text" id="editServicio">
+      <div class="modal-actions">
+        <button class="btn btn-sm" style="background:#e2e8f0;color:#334155;" onclick="cerrarModalEditar()">Cancelar</button>
+        <button class="btn btn-sm" style="background:var(--ucb-blue);color:white;" onclick="guardarEdicion()">Guardar Cambios</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    const API_URL = "https://ptobftgkn5.execute-api.us-east-1.amazonaws.com/reservas";
+    const HORARIOS_BASE = ["09:00", "10:00", "11:00", "14:00", "15:00", "16:00"];
+    let reservasGlobal = [];
+    let rolActual = "paciente";
+    let adminKeyMemoria = "";
+
+    function mostrarMensaje(texto, tipo = "ok") {
+      const el = document.getElementById("alerta");
+      el.style.display = "block";
+      if (tipo === "ok") { el.style.background = "var(--ok-bg)"; el.style.color = "var(--ok-txt)"; el.style.borderLeftColor = "#16a34a"; }
+      else if (tipo === "warn") { el.style.background = "var(--warn-bg)"; el.style.color = "var(--warn-txt)"; el.style.borderLeftColor = "#d97706"; }
+      else { el.style.background = "var(--err-bg)"; el.style.color = "var(--err-txt)"; el.style.borderLeftColor = "#dc2626"; }
+      el.textContent = texto;
+    }
+    function intentarAccesoAdmin() { if (rolActual === "admin") return; document.getElementById("modalLogin").style.display = "flex"; }
+    function cerrarModalLogin() { document.getElementById("modalLogin").style.display = "none"; }
+    function confirmarLoginAdmin() {
+      adminKeyMemoria = document.getElementById("inputLoginKey").value.trim();
+      cerrarModalLogin(); cambiarRol("admin");
+    }
+    function cambiarRol(nuevoRol) {
+      rolActual = nuevoRol;
+      const esAdmin = (rolActual === "admin");
+      document.getElementById("tabPaciente").classList.toggle("active", !esAdmin);
+      document.getElementById("tabAdmin").classList.toggle("active", esAdmin);
+      document.getElementById("adminTopbar").style.display = esAdmin ? "flex" : "none";
+      document.getElementById("panelKPIs").style.display = esAdmin ? "grid" : "none";
+      document.getElementById("thAcciones").style.display = esAdmin ? "table-cell" : "none";
+      document.getElementById("tituloTabla").textContent = esAdmin ? "Panel de Recepción — Gestión de Agenda (DynamoDB)" : "Horarios y Citas Registradas";
+      if (esAdmin) actualizarEstadoVisualClave(); else adminKeyMemoria = "";
+      renderizarTabla();
+    }
+    function activarModoPrueba403() {
+      if (adminKeyMemoria !== "clave-invalida-403") {
+        adminKeyMemoria = "clave-invalida-403";
+        mostrarMensaje("🧪 Modo prueba activado: Clave errónea en memoria. Haz clic en 'Editar' o 'Cancelar' para probar el error 403.", "warn");
+      } else {
+        adminKeyMemoria = "ucb-admin-2026";
+        mostrarMensaje("✅ Credencial válida restaurada (ucb-admin-2026).", "ok");
+      }
+      actualizarEstadoVisualClave();
+    }
+    function actualizarEstadoVisualClave() {
+      const span = document.getElementById("estadoClaveTexto");
+      if (adminKeyMemoria === "ucb-admin-2026") { span.textContent = "(Credencial X-Admin-Key válida)"; span.style.color = "#4ade80"; }
+      else { span.textContent = "(Simulando credencial inválida -> Probar 403)"; span.style.color = "#fca5a5"; }
+    }
+    function actualizarGrillaHorarios() {
+      const recurso = document.getElementById("recurso").value;
+      const fecha = document.getElementById("fecha").value;
+      const horaSeleccionada = document.getElementById("hora").value;
+      const contenedor = document.getElementById("slotsContainer");
+      contenedor.innerHTML = "";
+      HORARIOS_BASE.forEach(h => {
+        const slotId = `${recurso}#${fecha}#${h}`;
+        const cita = reservasGlobal.find(r => r.slot_id === slotId && r.estado === "CONFIRMADA");
+        const ocupado = Boolean(cita);
+        const btn = document.createElement("div");
+        btn.className = `slot-btn ${ocupado ? 'busy' : 'free'} ${horaSeleccionada === h ? 'selected' : ''}`;
+        btn.innerHTML = `${h}<small>${ocupado ? '🔴 Ocupado' : '🟢 Libre'}</small>`;
+        btn.onclick = () => {
+          document.getElementById("hora").value = h;
+          actualizarGrillaHorarios();
+          if (ocupado) mostrarMensaje(`⚠️ Horario ${h} ocupado por "${cita.cliente}". Si presionas confirmar, probarás el rechazo HTTP 409.`, "warn");
+        };
+        contenedor.appendChild(btn);
+      });
+    }
+    async function cargarReservas() {
+      try {
+        const res = await fetch(API_URL);
+        const data = await res.json();
+        reservasGlobal = data.reservas || [];
+        document.getElementById("kpiTotal").textContent = reservasGlobal.length;
+        document.getElementById("kpiConfirmadas").textContent = reservasGlobal.filter(r => r.estado === "CONFIRMADA").length;
+        document.getElementById("kpiCanceladas").textContent = reservasGlobal.filter(r => r.estado === "CANCELADA").length;
+        actualizarGrillaHorarios(); renderizarTabla();
+      } catch (err) { mostrarMensaje("Error conectando con API Gateway: " + err.message, "err"); }
+    }
+    function renderizarTabla() {
+      const texto = document.getElementById("buscador").value.toLowerCase();
+      const recFiltro = document.getElementById("filtroRecurso").value;
+      const estFiltro = document.getElementById("filtroEstado").value;
+      const tbody = document.getElementById("tablaBody");
+      const esAdmin = (rolActual === "admin");
+      tbody.innerHTML = "";
+      const filtradas = reservasGlobal.filter(r => {
+        const coincideTexto = (r.cliente || "").toLowerCase().includes(texto) || (r.servicio || "").toLowerCase().includes(texto);
+        const coincideRecurso = !recFiltro || r.recurso === recFiltro;
+        const coincideEstado = !estFiltro || r.estado === estFiltro;
+        return coincideTexto && coincideRecurso && coincideEstado;
+      });
+      if (filtradas.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="${esAdmin ? 5 : 4}" style="text-align:center;color:#64748b;padding:22px;">No se encontraron citas registradas.</td></tr>`;
+        return;
+      }
+      filtradas.forEach(r => {
+        const tr = document.createElement("tr");
+        const celdaAcciones = esAdmin ? `
+          <td style="text-align:right;white-space:nowrap;">
+            <button class="btn btn-sm btn-edit" onclick="abrirModalEditar('${r.slot_id}', '${r.cliente.replace(/'/g, "\\'")}', '${r.servicio.replace(/'/g, "\\'")}')">✏️ Editar</button>
+            <button class="btn btn-sm btn-cancel" onclick="cancelarReserva('${r.slot_id}')">🗑️ Cancelar</button>
+          </td>` : "";
+        tr.innerHTML = `
+          <td><strong style="color:var(--ucb-blue);">${r.recurso}</strong><br><small style="color:#64748b;">📅 ${r.fecha} · ⏰ ${r.hora}</small></td>
+          <td><strong>${r.cliente}</strong></td><td>${r.servicio}</td><td><span class="badge ${r.estado}">${r.estado}</span></td>${celdaAcciones}
+        `;
+        tbody.appendChild(tr);
+      });
+    }
+    async function crearReserva() {
+      const clienteInput = document.getElementById("cliente");
+      const payload = {
+        recurso: document.getElementById("recurso").value, fecha: document.getElementById("fecha").value,
+        hora: document.getElementById("hora").value, cliente: clienteInput.value.trim(), servicio: document.getElementById("servicio").value
+      };
+      const btn = document.getElementById("btnCrear");
+      btn.disabled = true; btn.textContent = "Verificando disponibilidad...";
+      try {
+        const res = await fetch(API_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const data = await res.json();
+        mostrarMensaje(`HTTP ${res.status}: ${data.mensaje || data.error}`, res.ok ? "ok" : "err");
+        if (res.ok) clienteInput.value = "";
+        await cargarReservas();
+      } finally { btn.disabled = false; btn.textContent = "Confirmar Reserva"; }
+    }
+    function abrirModalEditar(slot_id, cliente, servicio) {
+      document.getElementById("editSlotId").value = slot_id;
+      document.getElementById("modalSlotInfo").textContent = "Turno: " + slot_id;
+      document.getElementById("editCliente").value = cliente; document.getElementById("editServicio").value = servicio;
+      document.getElementById("modalEditar").style.display = "flex";
+    }
+    function cerrarModalEditar() { document.getElementById("modalEditar").style.display = "none"; }
+    async function guardarEdicion() {
+      const slot_id = document.getElementById("editSlotId").value;
+      const cliente = document.getElementById("editCliente").value.trim();
+      const servicio = document.getElementById("editServicio").value.trim();
+      const res = await fetch(API_URL, {
+        method: "PUT", headers: { "Content-Type": "application/json", "X-Admin-Key": adminKeyMemoria },
+        body: JSON.stringify({ slot_id, cliente, servicio })
+      });
+      const data = await res.json(); cerrarModalEditar();
+      mostrarMensaje(`HTTP ${res.status}: ${data.mensaje || data.error}`, res.ok ? "ok" : "err");
+      cargarReservas();
+    }
+    async function cancelarReserva(slot_id) {
+      const res = await fetch(`${API_URL}?slot_id=${encodeURIComponent(slot_id)}`, {
+        method: "DELETE", headers: { "X-Admin-Key": adminKeyMemoria }
+      });
+      const data = await res.json();
+      mostrarMensaje(`HTTP ${res.status}: ${data.mensaje || data.error}`, res.ok ? "ok" : "err");
+      cargarReservas();
+    }
+    cargarReservas();
+  </script>
+</body>
+</html>
+'''
+}
+
+for carpeta, archivos in estructura.items():
+    if carpeta:
+        os.makedirs(carpeta, exist_ok=True)
+    for archivo, contenido in archivos.items():
+        ruta = os.path.join(carpeta, archivo) if carpeta else archivo
+        with open(ruta, "w", encoding="utf-8") as f:
+            f.write(contenido)
+        print(f"Creado con éxito: {ruta}")
+
+print("\n¡Todo listo! Estructura de proyecto y código Lambda unificados en un solo script.")
